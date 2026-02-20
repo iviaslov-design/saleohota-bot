@@ -2,18 +2,58 @@ import os
 import re
 import asyncio
 import logging
-from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, Tuple
 
 import aiohttp
 import aiosqlite
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import aiohttp
 
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
+
+# ----------------------------
+# Config
+# ----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15").strip() or "15")
+DB_PATH = os.getenv("DB_PATH", "bot.db").strip() or "bot.db"
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in environment variables")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("saleohota-bot")
+
+# ----------------------------
+# WB helpers (FIX: no card.wb.ru)
+# ----------------------------
 BASKETS = [f"basket-{i:02d}.wb.ru" for i in range(1, 21)]  # 01..20 обычно хватает
+
+
+def extract_wb_nm(text: str) -> Optional[int]:
+    """
+    Accepts:
+    - "546168907"
+    - "546168907 (wb)"
+    - WB link: https://www.wildberries.ru/catalog/546168907/detail.aspx...
+    """
+    if not text:
+        return None
+
+    # WB link
+    m = re.search(r"wildberries\.ru/catalog/(\d+)", text)
+    if m:
+        return int(m.group(1))
+
+    # first long digit sequence
+    m = re.search(r"\b(\d{6,12})\b", text)
+    if m:
+        return int(m.group(1))
+
+    return None
+
 
 def wb_card_urls(nm: int) -> list[str]:
     vol = nm // 1_000_000
@@ -21,10 +61,8 @@ def wb_card_urls(nm: int) -> list[str]:
     path = f"/vol{vol}/part{part}/{nm}/info/ru/card.json"
     return [f"https://{host}{path}" for host in BASKETS]
 
+
 async def fetch_wb_card(nm: int, session: aiohttp.ClientSession) -> dict:
-    """
-    Returns parsed json from WB card.json
-    """
     last_err = None
     for url in wb_card_urls(nm):
         try:
@@ -37,408 +75,465 @@ async def fetch_wb_card(nm: int, session: aiohttp.ClientSession) -> dict:
             continue
     raise RuntimeError(f"WB card not found. Last error: {last_err}")
 
-def wb_extract_title_price(card_json: dict) -> tuple[str, int | None]:
+
+def wb_extract_title_price(card_json: dict) -> Tuple[str, Optional[int]]:
     """
-    card.json varies, but usually has `imt_name` and `priceU/salePriceU` in kopecks.
+    priceU/salePriceU are usually in kopecks
     """
     title = card_json.get("imt_name") or card_json.get("goods_name") or "Товар WB"
-    # price fields are often in "U" (kopecks)
     sale_u = card_json.get("salePriceU")
     price_u = card_json.get("priceU")
+
     price = None
     if isinstance(sale_u, int):
         price = sale_u // 100
     elif isinstance(price_u, int):
         price = price_u // 100
+
     return title, price
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("saleohota")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
+# ----------------------------
+# OZON helpers (parsing only for now)
+# ----------------------------
+def extract_ozon_id(text: str) -> Optional[str]:
+    """
+    Accepts:
+    - "ozon 123456789"
+    - ozon link containing product id at the end like ...-123456789/
+    """
+    if not text:
+        return None
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Set it in Railway Variables.")
+    t = text.strip().lower()
 
-DB_PATH = "data.sqlite3"
+    m = re.search(r"\bozon\s+(\d{6,12})\b", t)
+    if m:
+        return m.group(1)
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    # common ozon product link patterns: ...-123456789/ or .../product/...-123456789/
+    m = re.search(r"-([0-9]{6,12})/?(?:\?|$)", t)
+    if m and "ozon" in t:
+        return m.group(1)
 
-
-@dataclass
-class Product:
-    marketplace: str  # wb | ozon
-    product_id: str   # wb nmId | ozon sku (best-effort)
-    url: str
-    title: str
-    price_rub: int
+    return None
 
 
-# ---------- DB ----------
+# ----------------------------
+# DB
+# ----------------------------
 CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS watches (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  marketplace TEXT NOT NULL,
-  product_id TEXT NOT NULL,
-  url TEXT NOT NULL,
-  title TEXT NOT NULL,
-  target_price INTEGER NOT NULL,
-  last_price INTEGER,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    marketplace TEXT NOT NULL,         -- "wb" | "ozon"
+    product_id TEXT NOT NULL,          -- nm for wb, id for ozon
+    title TEXT,
+    url TEXT,
+    target_price INTEGER NOT NULL,
+    last_price INTEGER,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_watches_user ON watches(user_id);
-CREATE INDEX IF NOT EXISTS idx_watches_item ON watches(marketplace, product_id);
 """
+
 
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(CREATE_SQL)
+        await db.execute(CREATE_SQL)
         await db.commit()
 
-async def add_watch(user_id: int, p: Product, target_price: int):
+
+async def db_add_subscription(
+    user_id: int,
+    chat_id: int,
+    marketplace: str,
+    product_id: str,
+    title: str,
+    url: str,
+    target_price: int,
+    last_price: Optional[int],
+):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO watches (user_id, marketplace, product_id, url, title, target_price, last_price) VALUES (?,?,?,?,?,?,?)",
-            (user_id, p.marketplace, p.product_id, p.url, p.title, target_price, p.price_rub)
+            """
+            INSERT INTO subscriptions (user_id, chat_id, marketplace, product_id, title, url, target_price, last_price, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                user_id,
+                chat_id,
+                marketplace,
+                product_id,
+                title,
+                url,
+                target_price,
+                last_price,
+                datetime.utcnow().isoformat(),
+            ),
         )
         await db.commit()
 
-async def list_watches(user_id: int):
+
+async def db_list_subscriptions(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT id, marketplace, title, target_price, last_price, url FROM watches WHERE user_id=? ORDER BY id DESC",
-            (user_id,)
+            """
+            SELECT id, marketplace, product_id, title, target_price, last_price, active, url
+            FROM subscriptions
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            """,
+            (chat_id,),
         )
         rows = await cur.fetchall()
         return rows
 
-async def delete_watch(user_id: int, watch_id: int) -> bool:
+
+async def db_remove_subscription(chat_id: int, sub_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM watches WHERE user_id=? AND id=?", (user_id, watch_id))
+        cur = await db.execute(
+            "DELETE FROM subscriptions WHERE chat_id = ? AND id = ?",
+            (chat_id, sub_id),
+        )
         await db.commit()
         return cur.rowcount > 0
 
-async def all_watches():
+
+async def db_get_active():
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT id, user_id, marketplace, product_id, url, title, target_price, last_price FROM watches"
+            """
+            SELECT * FROM subscriptions WHERE active = 1
+            """
         )
         return await cur.fetchall()
 
-async def update_last_price(watch_id: int, new_price: int):
+
+async def db_update_last_price(sub_id: int, last_price: Optional[int]):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE watches SET last_price=? WHERE id=?", (new_price, watch_id))
+        await db.execute(
+            "UPDATE subscriptions SET last_price = ? WHERE id = ?",
+            (last_price, sub_id),
+        )
         await db.commit()
 
 
-# ---------- Parsers ----------
-def normalize_input(text: str) -> str:
-    return text.strip()
+async def db_deactivate(sub_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE subscriptions SET active = 0 WHERE id = ?", (sub_id,))
+        await db.commit()
 
-def detect_marketplace_and_id(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+
+# ----------------------------
+# Bot state (waiting for target price)
+# ----------------------------
+PENDING = {}  # user_id -> dict(marketplace, product_id, title, url, last_price)
+
+
+def is_price_message(text: str) -> Optional[int]:
     """
-    Returns (marketplace, product_id, url_guess)
-    marketplace: 'wb' or 'ozon'
-    product_id: wb nmId (digits) or ozon sku (digits best-effort)
+    Accepts: 5000 or 5 000 or 5.000
     """
-    t = normalize_input(text)
+    if not text:
+        return None
+    t = text.strip().replace(" ", "").replace(".", "")
+    if not t.isdigit():
+        return None
+    price = int(t)
+    if price <= 0:
+        return None
+    return price
 
-    # WB by link or digits
-    if "wildberries.ru" in t:
-        m = re.search(r"/catalog/(\d+)/", t)
-        if m:
-            nm = m.group(1)
-            return "wb", nm, t
-        # sometimes query contains nm=...
-        m = re.search(r"nm=(\d+)", t)
-        if m:
-            nm = m.group(1)
-            return "wb", nm, t
 
-    if re.fullmatch(r"\d{6,12}", t):
-        # ambiguous: could be wb nmId or ozon sku; we'll ask later? For MVP: assume WB if not told.
-        # We'll treat as WB by default, but user can prefix "ozon 123"
-        return "wb", t, f"https://www.wildberries.ru/catalog/{t}/detail.aspx"
+# ----------------------------
+# Price checking
+# ----------------------------
+async def fetch_current_price(marketplace: str, product_id: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Returns: (price, title, url)
+    """
+    if marketplace == "wb":
+        nm = int(product_id)
+        url = f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
+        async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+            card = await fetch_wb_card(nm, session)
+            title, price = wb_extract_title_price(card)
+            return price, title, url
 
-    # Ozon by link
-    if "ozon.ru" in t:
-        # Try to extract SKU from url like .../product/...-123456789/
-        m = re.search(r"-(\d{6,12})/?(\?|$)", t)
-        if m:
-            sku = m.group(1)
-            return "ozon", sku, t
-        return "ozon", "unknown", t  # best-effort
-
-    # Ozon by "ozon 123456"
-    m = re.match(r"ozon\s+(\d{6,12})", t, re.IGNORECASE)
-    if m:
-        sku = m.group(1)
-        return "ozon", sku, f"https://www.ozon.ru/product/{sku}/"
-
-    # WB by "wb 123"
-    m = re.match(r"wb\s+(\d{6,12})", t, re.IGNORECASE)
-    if m:
-        nm = m.group(1)
-        return "wb", nm, f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
+    # OZON: parsing saved, fetching disabled (yet)
+    if marketplace == "ozon":
+        return None, None, None
 
     return None, None, None
 
 
-async def fetch_wb(session: aiohttp.ClientSession, nm_id: str) -> Product:
-    # WB public JSON endpoint
-    url = f"https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&spp=0&nm={nm_id}"
-    async with session.get(url, headers={"User-Agent": UA}) as r:
-        r.raise_for_status()
-        data = await r.json(content_type=None)
-
-    products = data.get("data", {}).get("products", [])
-    if not products:
-        raise ValueError("WB: product not found")
-
-    p = products[0]
-    name = p.get("name") or f"WB {nm_id}"
-    # Prices often in kopecks *? On WB: salePriceU / priceU are in "cents" (руб*100)
-    price_u = p.get("salePriceU") or p.get("priceU") or 0
-    price_rub = int(price_u // 100) if isinstance(price_u, int) else 0
-
-    link = f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
-    return Product(marketplace="wb", product_id=nm_id, url=link, title=name, price_rub=price_rub)
-
-
-async def fetch_ozon(session: aiohttp.ClientSession, url: str, sku_hint: str) -> Product:
-    """
-    Best-effort Ozon parsing:
-    - loads HTML and extracts JSON-like price and title using regex.
-    This may break if Ozon changes markup. Good enough for MVP.
-    """
-    async with session.get(url, headers={"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}) as r:
-        r.raise_for_status()
-        html = await r.text()
-
-    # Title: try og:title
-    title = None
-    m = re.search(r'<meta property="og:title" content="([^"]+)"', html)
-    if m:
-        title = m.group(1).strip()
-
-    # Price: try og:price:amount
-    price = None
-    m = re.search(r'<meta property="product:price:amount" content="([^"]+)"', html)
-    if m:
-        raw = m.group(1).strip().replace(" ", "").replace(",", ".")
-        try:
-            price = int(float(raw))
-        except:
-            price = None
-
-    # fallback: search common json keys
-    if price is None:
-        # look for "finalPrice" or "price"
-        m = re.search(r'"finalPrice"\s*:\s*{"value"\s*:\s*(\d+)', html)
-        if m:
-            price = int(m.group(1))
-        else:
-            m = re.search(r'"price"\s*:\s*{"value"\s*:\s*(\d+)', html)
-            if m:
-                price = int(m.group(1))
-
-    if not title:
-        title = f"Ozon {sku_hint if sku_hint != 'unknown' else ''}".strip()
-
-    if price is None:
-        raise ValueError("Ozon: could not parse price (site may have changed)")
-
-    product_id = sku_hint if sku_hint and sku_hint != "unknown" else "unknown"
-    return Product(marketplace="ozon", product_id=product_id, url=url, title=title, price_rub=price)
-
-
-async def resolve_product(text: str) -> Product:
-    marketplace, pid, url = detect_marketplace_and_id(text)
-    if not marketplace:
-        raise ValueError("Не понял ссылку/артикул. Пришли ссылку WB/Ozon или артикул. Для Ozon можно: `ozon 123456789`")
-
-    timeout = aiohttp.ClientTimeout(total=25)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        if marketplace == "wb":
-            return await fetch_wb(session, pid)
-        else:
-            # ozon
-            return await fetch_ozon(session, url, pid)
-
-
-# ---------- Bot UI ----------
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="add")],
-        [InlineKeyboardButton(text="📋 Мои отслеживания", callback_data="list")],
-    ])
-
-def back_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
-    ])
-
-dp = Dispatcher()
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
-
-# Simple in-memory state: user_id -> awaiting ("item" or "price") and temp product
-USER_STATE = {}
-USER_TEMP = {}
-
-
-@dp.message(CommandStart())
-async def start(m: Message):
-    await m.answer(
-        "Привет! Я <b>ОхотаНаСкидки</b> 🦆\n\n"
-        "Я слежу за ценами на <b>Wildberries</b> и <b>Ozon</b> и уведомляю, когда цена станет <= твоей.\n\n"
-        "Нажми кнопку ниже:",
-        reply_markup=main_menu()
-    )
-
-@dp.callback_query(F.data == "home")
-async def home(c: CallbackQuery):
-    await c.message.edit_text("Выбери действие:", reply_markup=main_menu())
-    await c.answer()
-
-@dp.callback_query(F.data == "add")
-async def add(c: CallbackQuery):
-    USER_STATE[c.from_user.id] = "item"
-    await c.message.edit_text(
-        "Ок! Пришли <b>ссылку</b> на товар WB/Ozon или <b>артикул</b>.\n\n"
-        "Примеры:\n"
-        "• https://www.wildberries.ru/catalog/123456/detail.aspx\n"
-        "• 123456 (WB)\n"
-        "• https://www.ozon.ru/product/.....-123456789/\n"
-        "• ozon 123456789",
-        reply_markup=back_menu()
-    )
-    await c.answer()
-
-@dp.callback_query(F.data == "list")
-async def list_my(c: CallbackQuery):
-    rows = await list_watches(c.from_user.id)
-    if not rows:
-        await c.message.edit_text("Пока нет отслеживаний. Добавим?", reply_markup=main_menu())
-        await c.answer()
-        return
-
-    lines = ["<b>Твои отслеживания:</b>\n"]
-    kb = []
-    for (wid, mp, title, target, last, url) in rows[:30]:
-        last_txt = f"{last}₽" if last is not None else "—"
-        mp_txt = "WB" if mp == "wb" else "Ozon"
-        lines.append(f"#{wid} • <b>{mp_txt}</b> • {title}\nцель: <b>{target}₽</b> • последняя: <b>{last_txt}</b>\n{url}\n")
-        kb.append([InlineKeyboardButton(text=f"🗑 Удалить #{wid}", callback_data=f"del:{wid}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="home")])
-
-    await c.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("del:"))
-async def del_watch(c: CallbackQuery):
-    wid = int(c.data.split(":")[1])
-    ok = await delete_watch(c.from_user.id, wid)
-    await c.answer("Удалено" if ok else "Не найдено", show_alert=False)
-    # refresh
-    await list_my(c)
-
-@dp.message()
-async def on_text(m: Message):
-    uid = m.from_user.id
-    state = USER_STATE.get(uid)
-
-    if state == "item":
-        text = m.text or ""
-        try:
-            p = await resolve_product(text)
-        except Exception as e:
-            await m.answer(f"Не получилось распознать товар 😕\nПричина: <code>{e}</code>\n\nПопробуй ещё раз или пришли ссылку.")
-            return
-
-        USER_TEMP[uid] = p
-        USER_STATE[uid] = "price"
-        await m.answer(
-            f"Нашёл товар:\n<b>{p.title}</b>\nТекущая цена: <b>{p.price_rub}₽</b>\n\n"
-            f"Теперь напиши цену, при которой уведомить (например: 4990):",
-            reply_markup=back_menu()
-        )
-        return
-
-    if state == "price":
-        raw = (m.text or "").strip().replace(" ", "")
-        if not raw.isdigit():
-            await m.answer("Напиши число (например 4990).")
-            return
-
-        target = int(raw)
-        p: Product = USER_TEMP.get(uid)
-        if not p:
-            USER_STATE.pop(uid, None)
-            await m.answer("Что-то пошло не так. Давай заново: /start")
-            return
-
-        await add_watch(uid, p, target)
-        USER_STATE.pop(uid, None)
-        USER_TEMP.pop(uid, None)
-
-        await m.answer(
-            f"Готово ✅\nЯ слежу за:\n<b>{p.title}</b>\n"
-            f"Уведомлю, когда цена станет ≤ <b>{target}₽</b>.\n\n"
-            f"Посмотреть список: нажми <b>Мои отслеживания</b>",
-            reply_markup=main_menu()
-        )
-        return
-
-    # default help
-    await m.answer("Нажми кнопку в меню ниже 👇", reply_markup=main_menu())
-
-
-# ---------- Scheduler ----------
-async def check_prices():
-    rows = await all_watches()
+async def check_prices(bot: Bot):
+    rows = await db_get_active()
     if not rows:
         return
 
-    timeout = aiohttp.ClientTimeout(total=25)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for (wid, user_id, mp, pid, url, title, target, last_price) in rows:
-            try:
-                if mp == "wb":
-                    p = await fetch_wb(session, pid)
-                else:
-                    p = await fetch_ozon(session, url, pid)
-                new_price = p.price_rub
-            except Exception as e:
-                log.warning("Check failed wid=%s mp=%s err=%s", wid, mp, e)
+    for r in rows:
+        sub_id = r["id"]
+        chat_id = r["chat_id"]
+        marketplace = r["marketplace"]
+        product_id = r["product_id"]
+        target_price = r["target_price"]
+        old_last = r["last_price"]
+        url = r["url"] or ""
+        title = r["title"] or ""
+
+        try:
+            price, new_title, new_url = await fetch_current_price(marketplace, product_id)
+
+            # OZON пока пропускаем
+            if marketplace == "ozon":
+                # чтобы не спамить каждую проверку — ничего не шлём
                 continue
 
-            if last_price is None or new_price != last_price:
-                await update_last_price(wid, new_price)
+            if new_title:
+                title = new_title
+            if new_url:
+                url = new_url
 
-            if new_price <= int(target) and (last_price is None or last_price > int(target)):
-                # notify only on crossing threshold downward
-                try:
-                    await bot.send_message(
-                        user_id,
-                        f"🔥 Цена снизилась!\n<b>{title}</b>\n"
-                        f"Теперь: <b>{new_price}₽</b> (цель: <b>{target}₽</b>)\n{url}"
-                    )
-                except Exception as e:
-                    log.warning("Notify failed user=%s err=%s", user_id, e)
+            await db_update_last_price(sub_id, price)
+
+            if price is None:
+                continue
+
+            # Notify if reached
+            if price <= target_price:
+                await bot.send_message(
+                    chat_id,
+                    f"🎯 Цена достигнута!\n"
+                    f"{'WB' if marketplace=='wb' else marketplace.upper()}: {title}\n"
+                    f"Текущая цена: {price} ₽ (цель: {target_price} ₽)\n"
+                    f"{url}\n\n"
+                    f"Подписка отключена (ID {sub_id}).",
+                )
+                await db_deactivate(sub_id)
+            else:
+                # Optional: you can notify on big drop; currently silent
+                pass
+
+        except Exception as e:
+            logger.warning(f"Check failed sub_id={sub_id}: {e}")
 
 
+# ----------------------------
+# Health server (Render friendly)
+# ----------------------------
+async def start_health_server():
+    app = web.Application()
+
+    async def health(_):
+        return web.json_response({"ok": True})
+
+    async def root(_):
+        return web.Response(text="ok")
+
+    app.router.add_get("/health", health)
+    app.router.add_get("/", root)
+
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health server started on 0.0.0.0:{port}")
+
+
+# ----------------------------
+# Bot handlers
+# ----------------------------
+dp = Dispatcher()
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "Привет! Я бот «ОхотаНаСкидки» 🦆\n\n"
+        "Пришли:\n"
+        "• ссылку WB или артикул (например: 546168907)\n"
+        "• или Ozon: `ozon 123456789`\n\n"
+        "Я спрошу цену, которую ты хочешь дождаться, и буду мониторить.\n\n"
+        "Команды:\n"
+        "/list — список подписок\n"
+        "/remove <id> — удалить подписку\n"
+        "/help — помощь"
+    )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "Как пользоваться:\n"
+        "1) Пришли ссылку WB или артикул\n"
+        "2) В ответ пришли желаемую цену (числом)\n"
+        "3) Я буду проверять цену каждые N минут\n\n"
+        "Примеры:\n"
+        "• 546168907\n"
+        "• 546168907 (wb)\n"
+        "• https://www.wildberries.ru/catalog/546168907/detail.aspx\n\n"
+        "Ozon пока сохраняю, мониторинг подключим следующим шагом.\n\n"
+        "/list\n"
+        "/remove 12"
+    )
+
+
+@dp.message(Command("list"))
+async def cmd_list(message: types.Message):
+    rows = await db_list_subscriptions(message.chat.id)
+    if not rows:
+        await message.answer("Подписок пока нет. Пришли ссылку WB/Ozon или артикул 🙂")
+        return
+
+    lines = ["📌 Твои подписки:"]
+    for r in rows:
+        status = "✅" if r["active"] == 1 else "⏸"
+        mp = r["marketplace"].upper()
+        title = (r["title"] or "").strip()
+        if not title:
+            title = f"{mp} {r['product_id']}"
+        lp = r["last_price"]
+        lp_txt = f"{lp} ₽" if lp is not None else "—"
+        lines.append(
+            f"{status} ID {r['id']} | {mp} | цель: {r['target_price']} ₽ | последняя: {lp_txt}\n{title}"
+        )
+    await message.answer("\n\n".join(lines))
+
+
+@dp.message(Command("remove"))
+async def cmd_remove(message: types.Message):
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Формат: /remove <id>\nПример: /remove 12")
+        return
+    sub_id = int(parts[1])
+    ok = await db_remove_subscription(message.chat.id, sub_id)
+    await message.answer("Удалил ✅" if ok else "Не нашёл подписку с таким ID 🤷‍♂️")
+
+
+@dp.message()
+async def on_message(message: types.Message):
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    user_id = message.from_user.id
+
+    # 1) If user is replying with target price
+    if user_id in PENDING:
+        price = is_price_message(text)
+        if price is None:
+            await message.answer("Напиши цену числом, например: 4990")
+            return
+
+        pending = PENDING.pop(user_id)
+        await db_add_subscription(
+            user_id=user_id,
+            chat_id=message.chat.id,
+            marketplace=pending["marketplace"],
+            product_id=pending["product_id"],
+            title=pending.get("title", ""),
+            url=pending.get("url", ""),
+            target_price=price,
+            last_price=pending.get("last_price"),
+        )
+
+        await message.answer(
+            f"✅ Добавил в отслеживание!\n"
+            f"{pending['marketplace'].upper()}: {pending.get('title','')}\n"
+            f"Цель: {price} ₽\n"
+            f"Проверка каждые {CHECK_INTERVAL_MINUTES} мин.\n\n"
+            f"/list — посмотреть подписки"
+        )
+        return
+
+    # 2) WB: parse + fetch card (FIX)
+    nm = extract_wb_nm(text)
+    if nm:
+        try:
+            async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+                card = await fetch_wb_card(nm, session)
+                title, current_price = wb_extract_title_price(card)
+                url = f"https://www.wildberries.ru/catalog/{nm}/detail.aspx"
+
+            PENDING[user_id] = {
+                "marketplace": "wb",
+                "product_id": str(nm),
+                "title": title,
+                "url": url,
+                "last_price": current_price,
+            }
+
+            if current_price is not None:
+                await message.answer(
+                    f"✅ WB товар найден:\n{title}\n"
+                    f"Текущая цена: {current_price} ₽\n{url}\n\n"
+                    f"Теперь напиши цену, которую хочешь дождаться (например: 4990)."
+                )
+            else:
+                await message.answer(
+                    f"✅ WB товар найден:\n{title}\n{url}\n\n"
+                    f"Теперь напиши цену, которую хочешь дождаться (например: 4990)."
+                )
+        except Exception as e:
+            await message.answer(
+                "Не получилось распознать товар 😕\n"
+                f"Причина: {e}\n\n"
+                "Пришли ссылку WB или артикул."
+            )
+        return
+
+    # 3) OZON: parse and store (monitoring to be added later)
+    ozon_id = extract_ozon_id(text)
+    if ozon_id:
+        PENDING[user_id] = {
+            "marketplace": "ozon",
+            "product_id": ozon_id,
+            "title": f"Ozon товар {ozon_id}",
+            "url": text if "ozon" in text.lower() else f"ozon {ozon_id}",
+            "last_price": None,
+        }
+        await message.answer(
+            f"✅ Ozon распознал (ID {ozon_id}).\n"
+            "Сейчас у меня включён мониторинг цен WB.\n"
+            "Ozon подключим следующим шагом.\n\n"
+            "Напиши цену, которую хочешь дождаться (например: 4990)."
+        )
+        return
+
+    # 4) fallback
+    await message.answer(
+        "Не понял ссылку/артикул 🤷‍♂️\n\n"
+        "Пришли:\n"
+        "• ссылку WB или артикул (например: 546168907)\n"
+        "• или Ozon: `ozon 123456789`\n\n"
+        "Команды: /help /list /remove <id>"
+    )
+
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
 async def main():
     await db_init()
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_prices, "interval", minutes=CHECK_INTERVAL_MINUTES, max_instances=1)
+    bot = Bot(token=BOT_TOKEN)
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(lambda: asyncio.create_task(check_prices(bot)), "interval", minutes=CHECK_INTERVAL_MINUTES)
     scheduler.start()
 
-    log.info("Bot started. Interval=%s minutes", CHECK_INTERVAL_MINUTES)
+    # Health server for Render
+    await start_health_server()
+
+    logger.info("Bot started.")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
