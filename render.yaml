@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: saleohota-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: CHECK_INTERVAL_MINUTES
+        value: "15"
