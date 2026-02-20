@@ -11,7 +11,46 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import aiohttp
 
+BASKETS = [f"basket-{i:02d}.wb.ru" for i in range(1, 21)]  # 01..20 обычно хватает
+
+def wb_card_urls(nm: int) -> list[str]:
+    vol = nm // 1_000_000
+    part = nm // 1_000
+    path = f"/vol{vol}/part{part}/{nm}/info/ru/card.json"
+    return [f"https://{host}{path}" for host in BASKETS]
+
+async def fetch_wb_card(nm: int, session: aiohttp.ClientSession) -> dict:
+    """
+    Returns parsed json from WB card.json
+    """
+    last_err = None
+    for url in wb_card_urls(nm):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    return await r.json(content_type=None)
+                last_err = f"{r.status} {url}"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"WB card not found. Last error: {last_err}")
+
+def wb_extract_title_price(card_json: dict) -> tuple[str, int | None]:
+    """
+    card.json varies, but usually has `imt_name` and `priceU/salePriceU` in kopecks.
+    """
+    title = card_json.get("imt_name") or card_json.get("goods_name") or "Товар WB"
+    # price fields are often in "U" (kopecks)
+    sale_u = card_json.get("salePriceU")
+    price_u = card_json.get("priceU")
+    price = None
+    if isinstance(sale_u, int):
+        price = sale_u // 100
+    elif isinstance(price_u, int):
+        price = price_u // 100
+    return title, price
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("saleohota")
